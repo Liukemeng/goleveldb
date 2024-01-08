@@ -23,18 +23,18 @@ type tSet struct {
 }
 
 type version struct {
-	id int64 // unique monotonous increasing version id
+	id int64 // unique monotonous increasing version id  session中的ntVersionID字段赋值
 	s  *session
 
-	levels []tFiles
+	levels []tFiles // 每一层的sst文件结构,全量的。
 
 	// Level that should be compacted next and its compaction score.
 	// Score < 1 means compaction is not strictly needed. These fields
 	// are initialized by computeCompaction()
-	cLevel int
-	cScore float64
+	cLevel int     // 下一次需要进行table compaction的level
+	cScore float64 // 下一次需要进行table compaction的level的分数
 
-	cSeek unsafe.Pointer
+	cSeek unsafe.Pointer // 保存由于无效查询而需要进行table compaction的tSet
 
 	closing  bool
 	ref      int
@@ -111,6 +111,7 @@ func (v *version) walkOverlapping(aux tFiles, ikey internalKey, f func(level int
 			continue
 		}
 
+		// level 0层需要遍历查找
 		if level == 0 {
 			// Level-0 files may overlap each other. Find all files that
 			// overlap ukey.
@@ -122,6 +123,7 @@ func (v *version) walkOverlapping(aux tFiles, ikey internalKey, f func(level int
 				}
 			}
 		} else {
+			// 非0层先二分查找到大于ikey的最近的一个tFile
 			if i := tables.searchMax(v.s.icmp, ikey); i < len(tables) {
 				t := tables[i]
 				if v.s.icmp.uCompare(ukey, t.imin.ukey()) >= 0 {
@@ -131,7 +133,7 @@ func (v *version) walkOverlapping(aux tFiles, ikey internalKey, f func(level int
 				}
 			}
 		}
-
+		// 在这一层没找到的处理逻辑
 		if lf != nil && !lf(level) {
 			return
 		}
@@ -144,7 +146,7 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 	}
 
 	ukey := ikey.ukey()
-	sampleSeeks := !v.s.o.GetDisableSeeksCompaction()
+	sampleSeeks := !v.s.o.GetDisableSeeksCompaction() // !false=true
 
 	var (
 		tset  *tSet
@@ -159,8 +161,9 @@ func (v *version) get(aux tFiles, ikey internalKey, ro *opt.ReadOptions, noValue
 
 	err = ErrNotFound
 
-	// Since entries never hop across level, finding key/value
-	// in smaller level make later levels irrelevant.
+	// Since entries never hop across level, finding key/value in smaller level make later levels irrelevant.
+	// walkOverlapping找到可能重叠的 sst
+	// f基于某个sst去找
 	v.walkOverlapping(aux, ikey, func(level int, t *tFile) bool {
 		if sampleSeeks && level >= 0 && !tseek {
 			if tset == nil {
@@ -277,9 +280,13 @@ func (v *version) newStaging() *versionStaging {
 }
 
 // Spawn a new version based on this version.
+// 根据sessionRecord计算并返回新的version，然后也会计算出下一次进行table compaction的level
 func (v *version) spawn(r *sessionRecord, trivial bool) *version {
+	// 构造versionStaging结构
 	staging := v.newStaging()
+	// 根据sessionRecord更新versionStaging中每层需要增加和删除的sst
 	staging.commit(r)
+	// 计算并返回新的version，然后也会计算出下一次进行table compaction的level
 	return staging.finish(trivial)
 }
 
@@ -327,19 +334,25 @@ func (v *version) offsetOf(ikey internalKey) (n int64, err error) {
 	return
 }
 
+// 传进来的是刚刚写入level0层的sst
+// 如果这个sst跟level 0中其他sst文件不存在重叠，且和level i中的sst文件也不存在冲突，且跟level i+1中的sst文件重叠不超过10个，则返回i
+// 表示将这个新的sst直接写入level i
 func (v *version) pickMemdbLevel(umin, umax []byte, maxLevel int) (level int) {
 	if maxLevel > 0 {
 		if len(v.levels) == 0 {
 			return maxLevel
 		}
+		// 如果和第0层的sst没有重叠部分则按照如下逻辑处理
 		if !v.levels[0].overlaps(v.s.icmp, umin, umax, true) {
 			var overlaps tFiles
 			for ; level < maxLevel; level++ {
 				if pLevel := level + 1; pLevel >= len(v.levels) {
 					return maxLevel
+					// 如果和level+1层的sst有重叠部分，跳出并返回level
 				} else if v.levels[pLevel].overlaps(v.s.icmp, umin, umax, false) {
 					break
 				}
+				// 如果和level+2层重叠的sst超过10，跳出并返回level
 				if gpLevel := level + 2; gpLevel < len(v.levels) {
 					overlaps = v.levels[gpLevel].getOverlaps(overlaps, v.s.icmp, umin, umax, false)
 					if overlaps.size() > int64(v.s.o.GetCompactionGPOverlaps(level)) {
@@ -348,10 +361,12 @@ func (v *version) pickMemdbLevel(umin, umax []byte, maxLevel int) (level int) {
 				}
 			}
 		}
+		// 如果和第0层的sst有重叠部分，则返回0
 	}
 	return
 }
 
+// 计算下一次需要进行table compaction的level和source
 func (v *version) computeCompaction() {
 	// Precomputed best level for next compaction
 	bestLevel := int(-1)
@@ -377,8 +392,10 @@ func (v *version) computeCompaction() {
 			// file size is small (perhaps because of a small write-buffer
 			// setting, or very high compression ratios, or lots of
 			// overwrites/deletions).
+			// 对于level 0层，如果超过了4个sst文件，score会大于1
 			score = float64(len(tables)) / float64(v.s.o.GetCompactionL0Trigger())
 		} else {
+			// 对于非level 0层，如果数据尺寸大于了10^iM，score会大于1
 			score = float64(size) / float64(v.s.o.GetCompactionTotalSize(level))
 		}
 
@@ -404,13 +421,13 @@ func (v *version) needCompaction() bool {
 }
 
 type tablesScratch struct {
-	added   map[int64]atRecord
-	deleted map[int64]struct{}
+	added   map[int64]atRecord // 记录这一层需要增加的sst文件，key是num
+	deleted map[int64]struct{} // 记录这一层需要删除的sst文件，key是num
 }
 
 type versionStaging struct {
-	base   *version
-	levels []tablesScratch
+	base   *version        // 基础的version
+	levels []tablesScratch // 根据sessionRecord计算出来每层需要增加和删除的sst
 }
 
 func (p *versionStaging) getScratch(level int) *tablesScratch {
@@ -450,8 +467,10 @@ func (p *versionStaging) commit(r *sessionRecord) {
 	}
 }
 
+// 计算并返回新的version，然后也会计算出下一次进行table compaction的level
 func (p *versionStaging) finish(trivial bool) *version {
 	// Build new version.
+	// 新的version
 	nv := newVersion(p.base.s)
 	numLevel := len(p.levels)
 	if len(p.base.levels) > numLevel {
@@ -506,6 +525,9 @@ func (p *versionStaging) finish(trivial bool) *version {
 			// already ordered arrays. Therefore, for the normal table compaction, we use
 			// binary search here to find the insert index to insert a batch of new added
 			// files directly instead of using qsort.
+			// 将add delete 的sst放入new version中
+			// 按序插入到这一层对应的位置
+			// 注意对于0层来说，每个sst内部是有序的，但是sst之间是无序的
 			if trivial && len(scratch.added) > 0 {
 				added := make(tFiles, 0, len(scratch.added))
 				for _, r := range scratch.added {
@@ -522,7 +544,7 @@ func (p *versionStaging) finish(trivial bool) *version {
 					nt = append(nt[:index], append(added, nt[index:]...)...)
 				}
 				nv.levels[level] = nt
-				continue
+				continue // 注意这里的continue
 			}
 
 			// New tables.
@@ -546,12 +568,14 @@ func (p *versionStaging) finish(trivial bool) *version {
 	}
 
 	// Trim levels.
+	// 更新new version的levels
 	n := len(nv.levels)
 	for ; n > 0 && nv.levels[n-1] == nil; n-- {
 	}
 	nv.levels = nv.levels[:n]
 
 	// Compute compaction score for new version.
+	// 根据new version计算下一次需要进行table compaction的level
 	nv.computeCompaction()
 
 	return nv

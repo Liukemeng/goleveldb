@@ -37,6 +37,7 @@ type IteratorSeeker interface {
 	// It returns whether such pair exist.
 	//
 	// It is safe to modify the contents of the argument after Seek returns.
+	// 注释具有误导性
 	Seek(key []byte) bool
 
 	// Next moves the iterator to the next key/value pair.

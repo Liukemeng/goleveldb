@@ -24,13 +24,14 @@ const (
 	dirForward
 )
 
+// 该迭代器可以把多个sst中的kv，整体按序迭代出来
 type mergedIterator struct {
 	cmp    comparer.Comparer
-	iters  []Iterator
+	iters  []Iterator // 存每个sst的indexedIterator
 	strict bool
 
-	keys     [][]byte
-	index    int
+	keys     [][]byte // 存iters中每个iter(sst)中当前的min key，在迭代过程中Next时会更新
+	index    int      // keys中当前最小key对应的iters索引，从而去iters中找到对应的iter，然后就可以拿到这个value了。外面调用Next时更新，mergedIterator本身实现了heap的功能
 	dir      dir
 	err      error
 	errf     func(err error)
@@ -72,11 +73,12 @@ func (i *mergedIterator) First() bool {
 		return false
 	}
 
+	// 用每个sst中的第一个key构建小顶堆
 	h := i.indexHeap()
 	h.Reset(false)
 	for x, iter := range i.iters {
 		switch {
-		case iter.First():
+		case iter.First(): // 每个sst中第一个kv
 			i.keys[x] = assertKey(iter.Key())
 			h.Push(x)
 		case i.iterErr(iter):
@@ -172,6 +174,7 @@ func (i *mergedIterator) Next() bool {
 		return i.Next()
 	}
 
+	// 当前最小key的index，和对应的blockIter
 	x := i.index
 	iter := i.iters[x]
 	switch {
@@ -317,6 +320,7 @@ func NewMergedIterator(iters []Iterator, cmp comparer.Comparer, strict bool) Ite
 }
 
 // indexHeap implements heap.Interface.
+// 小顶堆
 type indexHeap mergedIterator
 
 func (h *indexHeap) Len() int { return len(h.indexes) }

@@ -36,7 +36,7 @@ const (
 
 type cpRecord struct {
 	level int
-	ikey  internalKey
+	ikey  internalKey // imax
 }
 
 type atRecord struct {
@@ -58,10 +58,10 @@ type sessionRecord struct {
 	journalNum     int64
 	prevJournalNum int64
 	nextFileNum    int64
-	seqNum         uint64
-	compPtrs       []cpRecord
-	addedTables    []atRecord
-	deletedTables  []dtRecord
+	seqNum         uint64     // 就是frozenSeq这个值，mem compaction会给此值赋值
+	compPtrs       []cpRecord // 记录每次进行table compaction时，某层处理的sst的max key，便于下次再对此层进行tc时，从下一个sst进行处理（轮转的方式）
+	addedTables    []atRecord // 记录在某层需要新添加的sst
+	deletedTables  []dtRecord // 记录在某层需要删除的sst
 
 	scratch [binary.MaxVarintLen64]byte
 	err     error

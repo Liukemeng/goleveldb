@@ -23,19 +23,24 @@ func (db *DB) writeJournal(batches []*Batch, seq uint64, sync bool) error {
 	if err := writeBatchesWithHeader(wr, batches, seq); err != nil {
 		return err
 	}
+	// 这里是将buf中的数据flush到writer中
 	if err := db.journal.Flush(); err != nil {
 		return err
 	}
+	// 这里是将writer中的数据flush到磁盘中
 	if sync {
 		return db.journalWriter.Sync()
 	}
 	return nil
 }
 
+// 阻塞式的进行一次mem compaction，将frozen 写入l0,
+// 并memDB变成frozen，然后创建并返回一个新的memDB
 func (db *DB) rotateMem(n int, wait bool) (mem *memDB, err error) {
 	retryLimit := 3
 retry:
 	// Wait for pending memdb compaction.
+	// 阻塞式的进行一次mem compaction，将frozen 写入l0
 	err = db.compTriggerWait(db.mcompCmdC)
 	if err != nil {
 		return
@@ -43,6 +48,7 @@ retry:
 	retryLimit--
 
 	// Create new memdb and journal.
+	// 并memDB变成frozen，然后创建一个新的memDB
 	mem, err = db.newMem(n)
 	if err != nil {
 		if err == errHasFrozenMem {
@@ -55,6 +61,7 @@ retry:
 	}
 
 	// Schedule memdb compaction.
+	// todo: 重复进行一次 mem compaction?
 	if wait {
 		err = db.compTriggerWait(db.mcompCmdC)
 	} else {
@@ -63,10 +70,16 @@ retry:
 	return
 }
 
+// 判断是否需要对memDB进行flush，最终会构建出能够写入bach的wmemDB
+// 分为4种情况：
+// 1、memDB容量大于batch的尺寸，不进行任何处理;
+// 2。memDB容量小于batch的尺寸，进行mem compaction，并创建新的memDB
+// 3、l0的sst文件数量大于8，sleep 1ms 一次；
+// 4、l0的sst文件数量大于12，阻塞写，进行一次table compaction；
 func (db *DB) flush(n int) (mdb *memDB, mdbFree int, err error) {
 	delayed := false
-	slowdownTrigger := db.s.o.GetWriteL0SlowdownTrigger()
-	pauseTrigger := db.s.o.GetWriteL0PauseTrigger()
+	slowdownTrigger := db.s.o.GetWriteL0SlowdownTrigger() // 8
+	pauseTrigger := db.s.o.GetWriteL0PauseTrigger()       // 12
 	flush := func() (retry bool) {
 		mdb = db.getEffectiveMem()
 		if mdb == nil {
@@ -79,15 +92,19 @@ func (db *DB) flush(n int) (mdb *memDB, mdbFree int, err error) {
 				mdb = nil
 			}
 		}()
-		tLen := db.s.tLen(0)
-		mdbFree = mdb.Free()
+		// l0的sst文件数量
+		tLen := db.s.tLen(0) // 0
+		mdbFree = mdb.Free() // 0
 		switch {
 		case tLen >= slowdownTrigger && !delayed:
+			// l0的sst大于8时，sleep 1ms，只sleep一次
 			delayed = true
 			time.Sleep(time.Millisecond)
 		case mdbFree >= n:
+			// memDB容量大于等于batch尺寸，不进行任何处理
 			return false
 		case tLen >= pauseTrigger:
+			// l0的sst大于12时，阻塞住，等待进行一次table compaction
 			delayed = true
 			// Set the write paused flag explicitly.
 			atomic.StoreInt32(&db.inWritePaused, 1)
@@ -98,10 +115,13 @@ func (db *DB) flush(n int) (mdb *memDB, mdbFree int, err error) {
 				return false
 			}
 		default:
+			// memDB容量小于batch尺寸
 			// Allow memdb to grow if it has no entry.
+			// memDB中没有kv时，通过上面第二个case跳出flush
 			if mdb.Len() == 0 {
 				mdbFree = n
 			} else {
+				// memDB容量小于batch尺寸时，进行mem compaction 并 创建容量为n的新memDB
 				mdb.decref()
 				mdb, err = db.rotateMem(n, false)
 				if err == nil {
@@ -151,9 +171,12 @@ func (db *DB) unlockWrite(overflow bool, merged int, err error) {
 }
 
 // ourBatch is batch that we can modify.
+// Write时，ourBatch是nil, put时，ourBatch就是batch
 func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 	// Try to flush memdb. This method would also trying to throttle writes
 	// if it is too fast and compaction cannot catch-up.
+	// 判断是否需要对memDB进行flush，最终会构建并返回能够写入batch的memDB，以及空闲的容量
+	// 可能会进行mem/table compaction
 	mdb, mdbFree, err := db.flush(batch.internalLen)
 	if err != nil {
 		db.unlockWrite(false, 0, err)
@@ -169,9 +192,10 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 
 	if merge {
 		// Merge limit.
+		// 合并写的剩余空间
 		var mergeLimit int
-		if batch.internalLen > 128<<10 {
-			mergeLimit = (1 << 20) - batch.internalLen
+		if batch.internalLen > 128<<10 { // 128K
+			mergeLimit = (1 << 20) - batch.internalLen // 1M
 		} else {
 			mergeLimit = 128 << 10
 		}
@@ -179,7 +203,6 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 		if mergeLimit > mergeCap {
 			mergeLimit = mergeCap
 		}
-
 	merge:
 		for mergeLimit > 0 {
 			select {
@@ -199,6 +222,7 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 						overflow = true
 						break merge
 					}
+					// 防御性编程，避免put时，外层没有封装成batch
 					if ourBatch == nil {
 						ourBatch = db.batchPool.Get().(*Batch)
 						ourBatch.Reset()
@@ -209,6 +233,7 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 					ourBatch.appendRec(incoming.keyType, incoming.key, incoming.value)
 					mergeLimit -= internalLen
 				}
+				// 更新sync
 				sync = sync || incoming.sync
 				merged++
 				db.writeMergedC <- true
@@ -220,20 +245,24 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 	}
 
 	// Release ourBatch if any.
+	// 释放ourBatch到内存池
 	if ourBatch != nil {
 		defer db.batchPool.Put(ourBatch)
 	}
 
 	// Seq number.
+	// 序号+1
 	seq := db.seq + 1
 
 	// Write journal.
+	// 写wal
 	if err := db.writeJournal(batches, seq, sync); err != nil {
 		db.unlockWrite(overflow, merged, err)
 		return err
 	}
 
 	// Put batches.
+	// 写memDB
 	for _, batch := range batches {
 		if err := batch.putMem(seq, mdb.DB); err != nil {
 			panic(err)
@@ -242,16 +271,20 @@ func (db *DB) writeLocked(batch, ourBatch *Batch, merge, sync bool) error {
 	}
 
 	// Incr seq number.
+	// seq加上kv数量
 	db.addSeq(uint64(batchesLen(batches)))
 
 	// Rotate memdb if it's reach the threshold.
+	// 前面已经将batchs写入了wal和memDB中，此处检查一下写入内容超过memDB的空闲空间，则进行一次mem compaction
 	if batch.internalLen >= mdbFree {
+		// 阻塞式的进行一次mem compaction，将frozen 写入l0,
+		// 并memDB变成frozen，然后创建一个新的memDB
 		if _, err := db.rotateMem(0, false); err != nil {
 			db.unlockWrite(overflow, merged, err)
 			return err
 		}
 	}
-
+	// 通知被merge写的请求，写入成功
 	db.unlockWrite(overflow, merged, nil)
 	return nil
 }
@@ -271,6 +304,7 @@ func (db *DB) Write(batch *Batch, wo *opt.WriteOptions) error {
 	// If the batch size is larger than write buffer, it may justified to write
 	// using transaction instead. Using transaction the batch will be written
 	// into tables directly, skipping the journaling.
+	// batch大于4MB，采用transaction将batch写入memDB
 	if batch.internalLen > db.s.o.GetWriteBuffer() && !db.s.o.GetDisableLargeBatchTransaction() {
 		tr, err := db.OpenTransaction()
 		if err != nil {
@@ -283,19 +317,22 @@ func (db *DB) Write(batch *Batch, wo *opt.WriteOptions) error {
 		return tr.Commit()
 	}
 
-	merge := !wo.GetNoWriteMerge() && !db.s.o.GetNoWriteMerge()
-	sync := wo.GetSync() && !db.s.o.GetNoSync()
+	merge := !wo.GetNoWriteMerge() && !db.s.o.GetNoWriteMerge() // !false && !false = true
+	sync := wo.GetSync() && !db.s.o.GetNoSync()                 // 实际业务设置为true && ！false = true
 
 	// Acquire write lock.
+	// 合并写
 	if merge {
 		select {
 		case db.writeMergeC <- writeMerge{sync: sync, batch: batch}:
+			// 合并写
 			if <-db.writeMergedC {
 				// Write is merged.
 				return <-db.writeAckC
 			}
 			// Write is not merged, the write lock is handed to us. Continue.
 		case db.writeLockC <- struct{}{}:
+			// 第一个请求走这里
 			// Write lock acquired.
 		case err := <-db.compPerErrC:
 			// Compaction error.
@@ -307,6 +344,7 @@ func (db *DB) Write(batch *Batch, wo *opt.WriteOptions) error {
 	} else {
 		select {
 		case db.writeLockC <- struct{}{}:
+			// 第一个请求走这里
 			// Write lock acquired.
 		case err := <-db.compPerErrC:
 			// Compaction error.
@@ -337,6 +375,7 @@ func (db *DB) putRec(kt keyType, key, value []byte, wo *opt.WriteOptions) error 
 				return <-db.writeAckC
 			}
 			// Write is not merged, the write lock is handed to us. Continue.
+			// 第一个put请求走这里，这个chan有1个容量
 		case db.writeLockC <- struct{}{}:
 			// Write lock acquired.
 		case err := <-db.compPerErrC:

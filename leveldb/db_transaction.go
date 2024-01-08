@@ -19,6 +19,7 @@ import (
 var errTransactionDone = errors.New("leveldb: transaction already closed")
 
 // Transaction is the transaction handle.
+// 事务
 type Transaction struct {
 	db        *DB
 	lk        sync.RWMutex
@@ -93,7 +94,9 @@ func (tr *Transaction) flush() error {
 	// Flush memdb.
 	if tr.mem.Len() != 0 {
 		tr.stats.startTimer()
+		// 创建memDB的迭代器
 		iter := tr.mem.NewIterator(nil)
+		// 创建sst文件，并将memDB中的内容写到sst
 		t, n, err := tr.db.s.tops.createFrom(iter)
 		iter.Release()
 		tr.stats.stopTimer()
@@ -107,6 +110,8 @@ func (tr *Transaction) flush() error {
 			tr.mem = tr.db.mpoolGet(0)
 			tr.mem.incref()
 		}
+		// 将sst放入tables中
+		// 并将sst放入sessionRecord中
 		tr.tables = append(tr.tables, t)
 		tr.rec.addTableFile(0, t)
 		tr.stats.write += t.size
@@ -116,12 +121,14 @@ func (tr *Transaction) flush() error {
 }
 
 func (tr *Transaction) put(kt keyType, key, value []byte) error {
+	// 如果mem中的剩余buffer小于kv大小，先将memDB中的内容写入sst文件
 	tr.ikScratch = makeInternalKey(tr.ikScratch, key, tr.seq+1, kt)
 	if tr.mem.Free() < len(tr.ikScratch)+len(value) {
 		if err := tr.flush(); err != nil {
 			return err
 		}
 	}
+	// 将kv写入memDB
 	if err := tr.mem.Put(tr.ikScratch, value); err != nil {
 		return err
 	}
@@ -174,6 +181,7 @@ func (tr *Transaction) Write(b *Batch, wo *opt.WriteOptions) error {
 	if tr.closed {
 		return errTransactionDone
 	}
+	// 对batch中的kv都写入memDB中
 	return b.replayInternal(func(i int, kt keyType, k, v []byte) error {
 		return tr.put(kt, k, v)
 	})

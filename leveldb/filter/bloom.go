@@ -14,6 +14,8 @@ func bloomHash(key []byte) uint32 {
 	return util.Hash(key, 0xbc9f1d34)
 }
 
+// 长安链设置的是10
+// 一个key占用多少个bit
 type bloomFilter int
 
 // Name: The bloom filter serializes its parameters and is backward compatible
@@ -66,8 +68,8 @@ func (f bloomFilter) NewGenerator() FilterGenerator {
 }
 
 type bloomFilterGenerator struct {
-	n int
-	k uint8
+	n int   // 每个key占用的bit数，长安链是10
+	k uint8 // 哈希函数的作用
 
 	keyHashes []uint32
 }
@@ -90,7 +92,7 @@ func (g *bloomFilterGenerator) Generate(b Buffer) {
 	nBits = nBytes * 8
 
 	dest := b.Alloc(int(nBytes) + 1)
-	dest[nBytes] = g.k
+	dest[nBytes] = g.k // 最后一个字节存的是k
 	for _, kh := range g.keyHashes {
 		delta := (kh >> 17) | (kh << 15) // Rotate right 17 bits
 		for j := uint8(0); j < g.k; j++ {

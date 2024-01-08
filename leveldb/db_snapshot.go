@@ -20,11 +20,12 @@ import (
 
 type snapshotElement struct {
 	seq uint64
-	ref int
+	ref int // 引用计数
 	e   *list.Element
 }
 
 // Acquires a snapshot, based on latest sequence.
+// 基于最新的seq，获取一个snapshot
 func (db *DB) acquireSnapshot() *snapshotElement {
 	db.snapsMu.Lock()
 	defer db.snapsMu.Unlock()
@@ -33,6 +34,7 @@ func (db *DB) acquireSnapshot() *snapshotElement {
 
 	if e := db.snapsList.Back(); e != nil {
 		se := e.Value.(*snapshotElement)
+		// 找到当前seq下的snap，则返回
 		if se.seq == seq {
 			se.ref++
 			return se
@@ -40,6 +42,8 @@ func (db *DB) acquireSnapshot() *snapshotElement {
 			panic("leveldb: sequence number is not increasing")
 		}
 	}
+	// todo 优化点：可以减少锁的粒度，上面用读写锁，下面用写锁
+	// 当前seq大于最后一个snap中的seq，则创建一个新的snap，并返回
 	se := &snapshotElement{seq: seq, ref: 1}
 	se.e = db.snapsList.PushBack(se)
 	return se

@@ -21,11 +21,12 @@ import (
 )
 
 // tFile holds basic information about a table.
+// sst 文件
 type tFile struct {
 	fd         storage.FileDesc
-	seekLeft   int32
+	seekLeft   int32 // 这个sst被无效读取这么多次后，将会触发table(major) compaction
 	size       int64
-	imin, imax internalKey
+	imin, imax internalKey // 这个sst文件中最小和最大的internalKey
 }
 
 // Returns true if given key is after largest key of this table.
@@ -70,6 +71,9 @@ func newTableFile(fd storage.FileDesc, size int64, imin, imax internalKey) *tFil
 	// same as the compaction of 40KB of data.  We are a little
 	// conservative and allow approximately one seek for every 16KB
 	// of data before triggering a compaction.
+	// 对于1MB的数据进行compaction，需要读写25MB文件，耗时250ms
+	// 所以，按照每16KB的数据量可以seek一次来计算，这个sst 在触发一次compaction之前，可以seek几次。
+	// 不小于100
 	f.seekLeft = int32(size / 16384)
 	if f.seekLeft < 100 {
 		f.seekLeft = 100
@@ -165,6 +169,7 @@ func (tf tFiles) searchMaxUkey(icmp *iComparer, umax []byte) int {
 
 // Returns true if given key range overlaps with one or more
 // tables key range. If unsorted is true then binary search will not be used.
+// 判断给定的umin和umax是否和某一层的sst中的data block存在重叠，存在重叠则返回true
 func (tf tFiles) overlaps(icmp *iComparer, umin, umax []byte, unsorted bool) bool {
 	if unsorted {
 		// Check against all files.
@@ -193,6 +198,11 @@ func (tf tFiles) overlaps(icmp *iComparer, umin, umax []byte, unsorted bool) boo
 // If overlapped is true then the search will be restarted if umax
 // expanded.
 // The dst content will be overwritten.
+// 检索并返回某层中跟umin和umax重叠的sst文件
+// sst0            sst1          sst2
+// 1-----5         10-----11     12-----15
+// 检索范围 6-----8，那么最终检索出来的是sst0，sst1
+// 这里有个优化，非0层是按照二分查找；0层是遍历查找，因为在0层查找时，0层每个sst内部有序，但是sst见无序，所以需要每次都从头查找
 func (tf tFiles) getOverlaps(dst tFiles, icmp *iComparer, umin, umax []byte, overlapped bool) tFiles {
 	// Short circuit if tf is empty
 	if len(tf) == 0 {
@@ -201,6 +211,7 @@ func (tf tFiles) getOverlaps(dst tFiles, icmp *iComparer, umin, umax []byte, ove
 	// For non-zero levels, there is no ukey hop across at all.
 	// And what's more, the files in these levels are strictly sorted,
 	// so use binary search instead of heavy traverse.
+	// 非0层二分查找
 	if !overlapped {
 		var begin, end int
 		// Determine the begin index of the overlapped file
@@ -238,20 +249,22 @@ func (tf tFiles) getOverlaps(dst tFiles, icmp *iComparer, umin, umax []byte, ove
 		return dst
 	}
 
+	// 0层遍历查找
 	dst = dst[:0]
 	for i := 0; i < len(tf); {
 		t := tf[i]
+		// 需要有重叠
 		if t.overlaps(icmp, umin, umax) {
 			if umin != nil && icmp.uCompare(t.imin.ukey(), umin) < 0 {
 				umin = t.imin.ukey()
 				dst = dst[:0]
-				i = 0
+				i = 0 // 这里会重新从第一个sst重新检索，umin已经变了，但是传进来的umin是一个新的切片，所以即使这里该了，外面也不会出问题
 				continue
 			} else if umax != nil && icmp.uCompare(t.imax.ukey(), umax) > 0 {
 				umax = t.imax.ukey()
 				// Restart search if it is overlapped.
 				dst = dst[:0]
-				i = 0
+				i = 0 // 这里也会重新从第一个sst重新检索
 				continue
 			}
 
@@ -369,7 +382,11 @@ func (t *tOps) create(tSize int) (*tWriter, error) {
 }
 
 // Builds table from src iterator.
+// 构造sst，并返回tFile
+// 把kvs写入data block, 同时会把对应的index写入index block，布隆过滤器写入filter block
+// sst文件刷盘（默认不刷盘）
 func (t *tOps) createFrom(src iterator.Iterator) (f *tFile, n int, err error) {
+	// 创建sst writer， tWriter
 	w, err := t.create(0)
 	if err != nil {
 		return
@@ -383,6 +400,10 @@ func (t *tOps) createFrom(src iterator.Iterator) (f *tFile, n int, err error) {
 		}
 	}()
 
+	// 迭代出来的kv，就是按序的
+	// 把上一个 data block的索引写入index block
+	// 写kv到data block的buf中
+	// 写key到布隆过滤器的keyHashes中，等每间隔2k数据时，再实际写入布隆过滤器
 	for src.Next() {
 		err = w.append(src.Key(), src.Value())
 		if err != nil {
@@ -395,6 +416,7 @@ func (t *tOps) createFrom(src iterator.Iterator) (f *tFile, n int, err error) {
 	}
 
 	n = w.tw.EntriesLen()
+	// sst文件刷盘（默认不刷盘），并构建tFile
 	f, err = w.finish()
 	return
 }
@@ -432,11 +454,13 @@ func (t *tOps) open(f *tFile) (ch *cache.Handle, err error) {
 // Finds key/value pair whose key is greater than or equal to the
 // given key.
 func (t *tOps) find(f *tFile, key []byte, ro *opt.ReadOptions) (rkey, rvalue []byte, err error) {
+	// 这里已经加载了整个sst
 	ch, err := t.open(f)
 	if err != nil {
 		return nil, nil, err
 	}
 	defer ch.Release()
+	// 启用filer
 	return ch.Value().(*table.Reader).Find(key, true, ro)
 }
 
@@ -461,11 +485,16 @@ func (t *tOps) offsetOf(f *tFile, key []byte) (offset int64, err error) {
 }
 
 // Creates an iterator from the given table.
+// 构造sst层面的迭代器，indexedIterator，可按序迭代sst中每个data block中的kv
+// 注意，sst内的k本身就是按序的
 func (t *tOps) newIterator(f *tFile, slice *util.Range, ro *opt.ReadOptions) iterator.Iterator {
+	// 获取sst
 	ch, err := t.open(f)
 	if err != nil {
 		return iterator.NewEmptyIterator(err)
 	}
+	// 构造sst层面的迭代器，indexedIterator，可按序迭代sst中每个data block中的kv
+	// 注意，sst内的k本身就是按序的
 	iter := ch.Value().(*table.Reader).NewIterator(slice, ro)
 	iter.SetReleaser(ch)
 	return iter
@@ -529,6 +558,7 @@ func newTableOps(s *session) *tOps {
 
 // tWriter wraps the table writer. It keep track of file descriptor
 // and added key range.
+// sst table 的writer, 每个data block默认4KB，但是sst大小是每限制的，0层的sst文件大小取决于frozen memDB的大小。
 type tWriter struct {
 	t *tOps
 
@@ -536,7 +566,7 @@ type tWriter struct {
 	w  storage.Writer
 	tw *table.Writer
 
-	first, last []byte
+	first, last []byte // first和last key
 }
 
 // Append key/value pair to the table.
@@ -565,6 +595,7 @@ func (w *tWriter) close() error {
 }
 
 // Finalizes the table and returns table file.
+// sst文件刷盘（默认不刷盘），并构建tFile
 func (w *tWriter) finish() (f *tFile, err error) {
 	defer func() {
 		if cerr := w.close(); cerr != nil {
@@ -579,12 +610,14 @@ func (w *tWriter) finish() (f *tFile, err error) {
 	if err != nil {
 		return
 	}
+	// sst文件刷盘，默认不会刷盘
 	if !w.t.noSync {
 		err = w.w.Sync()
 		if err != nil {
 			return
 		}
 	}
+	// 创建sst文件
 	f = newTableFile(w.fd, int64(w.tw.BytesLen()), internalKey(w.first), internalKey(w.last))
 	return
 }

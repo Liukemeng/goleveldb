@@ -7,8 +7,11 @@
 package memdb
 
 import (
+	"fmt"
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
+	"math/rand"
+	"testing"
 
 	"github.com/syndtr/goleveldb/leveldb/comparer"
 	"github.com/syndtr/goleveldb/leveldb/iterator"
@@ -131,3 +134,22 @@ var _ = testutil.Defer(func() {
 		})
 	})
 })
+
+func Test_randHeight(t *testing.T) {
+	r := rand.New(rand.NewSource(0xdeadbeef))
+	for i := 0; i < 10000; i++ {
+		if randH(r) == tMaxHeight {
+			fmt.Printf("randH:%d\n", tMaxHeight)
+			return
+		}
+	}
+}
+
+func randH(r *rand.Rand) (h int) {
+	const branching = 4
+	h = 1
+	for h < tMaxHeight && r.Int()%branching == 0 {
+		h++
+	}
+	return
+}

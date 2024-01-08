@@ -92,6 +92,7 @@ func (co *cachedOptions) GetCompactionSourceLimit(level int) int {
 	return co.Options.GetCompactionSourceLimit(level)
 }
 
+// 2MB
 func (co *cachedOptions) GetCompactionTableSize(level int) int {
 	if level < optCachedLevel {
 		return co.compactionTableSize[level]

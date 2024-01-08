@@ -57,11 +57,15 @@ type block struct {
 	bpool          *util.BufferPool
 	bh             blockHandle
 	data           []byte
-	restartsLen    int
-	restartsOffset int
+	restartsLen    int // restarts的数量  3
+	restartsOffset int // restart的起始偏移量
 }
 
+// 找到index block中某一条记录，并返回这个记录在index block中的index和offset,这个记录的特点是：
+// 首先，这个记录的separator是一个restart
+// 其次，是一个最近的小于key的记录
 func (b *block) seek(cmp comparer.Comparer, rstart, rlimit int, key []byte) (index, offset int, err error) {
+	// 3
 	index = sort.Search(b.restartsLen-rstart-(b.restartsLen-rlimit), func(i int) bool {
 		offset := int(binary.LittleEndian.Uint32(b.data[b.restartsOffset+4*(rstart+i):]))
 		offset++                                    // shared always zero, since this is a restart point
@@ -69,11 +73,15 @@ func (b *block) seek(cmp comparer.Comparer, rstart, rlimit int, key []byte) (ind
 		_, n2 := binary.Uvarint(b.data[offset+n1:]) // value length
 		m := offset + n1 + n2
 		return cmp.Compare(b.data[m:m+int(v1)], key) > 0
-	}) + rstart - 1
+	}) + rstart - 1 // 这里的-1是关键
+
+	// index 是0 = 1+0-1
 	if index < rstart {
 		// The smallest key is greater-than key sought.
+		// 这里的注释具有误导性
 		index = rstart
 	}
+	// 这个offset是0
 	offset = int(binary.LittleEndian.Uint32(b.data[b.restartsOffset+4*index:]))
 	return
 }
@@ -126,12 +134,15 @@ const (
 	dirForward
 )
 
+// 对index block和data block的迭代器
+// 做index block的迭代器时，配合外部的indexIter迭代器，本质上迭代的是data block中每个entry中的kv进行的迭代
+// 做data block的迭代器时，直接迭代kv
 type blockIter struct {
 	tr            *Reader
-	block         *block
+	block         *block // 存的是sst中的index block // 存的是data block
 	blockReleaser util.Releaser
 	releaser      util.Releaser
-	key, value    []byte
+	key, value    []byte // value是sst中data block的索引信息，通过外层indexIter的Get方法加载data block并构造blockIter迭代器  // 直接就是对应的kv
 	offset        int
 	// Previous offset, only filled by Next.
 	prevOffset   int
@@ -142,11 +153,11 @@ type blockIter struct {
 	dir dir
 	// Restart index slice range.
 	riStart int
-	riLimit int
+	riLimit int // restart的数量
 	// Offset slice range.
 	offsetStart     int
 	offsetRealStart int
-	offsetLimit     int
+	offsetLimit     int // restart的起始偏移量
 	// Error.
 	err error
 }
@@ -229,16 +240,24 @@ func (i *blockIter) Seek(key []byte) bool {
 		return false
 	}
 
+	// 找到index block中某一条记录，并返回这个记录在index block中的index和offset,这个记录的特点是：
+	// 首先，这个记录的separator是一个restart
+	// 其次，是一个最近的小于key的记录
+	// 0, 0
 	ri, offset, err := i.block.seek(i.tr.cmp, i.riStart, i.riLimit, key)
 	if err != nil {
 		i.sErr(err)
 		return false
 	}
+	// 0
 	i.restartIndex = ri
+	// 0
 	i.offset = max(i.offsetStart, offset)
 	if i.dir == dirSOI || i.dir == dirEOI {
 		i.dir = dirForward
 	}
+	// 这里判断第一个data block对应的index block中的记录separator d小于e，则继续往后迭代
+	// 迭代到第二个data block对应的index block中的记录separator g大于e，返回
 	for i.Next() {
 		if i.tr.cmp.Compare(i.key, key) >= 0 {
 			return true
@@ -262,6 +281,8 @@ func (i *blockIter) Next() bool {
 		i.prevNode = i.prevNode[:0]
 		i.prevKeys = i.prevKeys[:0]
 	}
+	// 0<0
+	// 2<0
 	for i.offset < i.offsetRealStart {
 		key, value, nShared, n, err := i.block.entry(i.offset)
 		if err != nil {
@@ -276,6 +297,8 @@ func (i *blockIter) Next() bool {
 		i.value = value
 		i.offset += n
 	}
+	// 0>=n
+	// 2>=n
 	if i.offset >= i.offsetLimit {
 		i.dir = dirEOI
 		if i.offset != i.offsetLimit {
@@ -283,6 +306,8 @@ func (i *blockIter) Next() bool {
 		}
 		return false
 	}
+	// 第一次key是d
+	// 第二次key是g
 	key, value, nShared, n, err := i.block.entry(i.offset)
 	if err != nil {
 		i.sErr(i.tr.fixErrCorruptedBH(i.block.bh, err))
@@ -295,6 +320,8 @@ func (i *blockIter) Next() bool {
 	i.key = append(i.key[:nShared], key...)
 	i.value = value
 	i.prevOffset = i.offset
+	// 2
+	// 3
 	i.offset += n
 	i.dir = dirForward
 	return true
@@ -482,14 +509,18 @@ func (b *filterBlock) Release() {
 	b.data = nil
 }
 
+// indexIter是index block的迭代器，用于构造每个data block的blockIter,迭代每个kv
+// 他包含了一个sst的reader，通过blockIter迭代器，可以在reader中拿到对应的data block
+// 包含了一个blockIter，本质就是一个blockIter
 type indexIter struct {
-	*blockIter
-	tr    *Reader
-	slice *util.Range
+	*blockIter // data block的迭代器，迭代的是每个entry中的kv进行的迭代
+	tr         *Reader
+	slice      *util.Range
 	// Options
 	fillCache bool
 }
 
+// 基于index block中的索引信息，查询到data block并返回blockIter
 func (i *indexIter) Get() iterator.Iterator {
 	value := i.Value()
 	if value == nil {
@@ -521,7 +552,7 @@ type Reader struct {
 	filter         filter.Filter
 	verifyChecksum bool
 
-	dataEnd                   int64
+	dataEnd                   int64 // data block index block 的截止处，即filter block的起始索引
 	metaBH, indexBH, filterBH blockHandle
 	indexBlock                *block
 	filterBlock               *filterBlock
@@ -559,6 +590,8 @@ func (r *Reader) fixErrCorruptedBH(bh blockHandle, err error) error {
 	return err
 }
 
+// 根据bh从reader中读取该范围的数据
+// 是否可以优化，读的时候只读某一范围的，而不是全读出来，再剪切？
 func (r *Reader) readRawBlock(bh blockHandle, verifyChecksum bool) ([]byte, error) {
 	data := r.bpool.Get(int(bh.length + blockTrailerLen))
 	if _, err := r.reader.ReadAt(data, int64(bh.offset)); err != nil && err != io.EOF {
@@ -608,13 +641,14 @@ func (r *Reader) readBlock(bh blockHandle, verifyChecksum bool) (*block, error) 
 	b := &block{
 		bpool:          r.bpool,
 		bh:             bh,
-		data:           data,
+		data:           data, // index block
 		restartsLen:    restartsLen,
 		restartsOffset: len(data) - (restartsLen+1)*4,
 	}
 	return b, nil
 }
 
+// 基于footer中记录的index block的index,检索出sst中的index block的信息
 func (r *Reader) readBlockCached(bh blockHandle, verifyChecksum, fillCache bool) (*block, util.Releaser, error) {
 	if r.cache != nil {
 		var (
@@ -795,6 +829,8 @@ func (r *Reader) getDataIterErr(dataBH blockHandle, slice *util.Range, verifyChe
 // after use.
 //
 // Also read Iterator documentation of the leveldb/iterator package.
+// 构造sst层面的迭代器，indexedIterator，可按序迭代sst中每个data block中的kv
+// 注意，sst内的k本身就是按序的
 func (r *Reader) NewIterator(slice *util.Range, ro *opt.ReadOptions) iterator.Iterator {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -804,19 +840,47 @@ func (r *Reader) NewIterator(slice *util.Range, ro *opt.ReadOptions) iterator.It
 	}
 
 	fillCache := !ro.GetDontFillCache()
+	// 检索出index block
 	indexBlock, rel, err := r.getIndexBlock(fillCache)
 	if err != nil {
 		return iterator.NewEmptyIterator(err)
 	}
+	// 基于index block构造indexIter
 	index := &indexIter{
 		blockIter: r.newBlockIter(indexBlock, rel, slice, true),
 		tr:        r,
 		slice:     slice,
 		fillCache: !ro.GetDontFillCache(),
 	}
+	// 基于indexIter构造sst层面的迭代器，indexedIterator，最终迭代的是sst中每个data block中的kv
+	// 注意，对于level 0层的sst，每个sst内部的k是有序的，sst间的k是无序的
 	return iterator.NewIndexedIterator(index, opt.GetStrict(r.o, ro, opt.StrictReader))
 }
 
+/*
+查找的key是 key=e
+
+data block: 下面一个格子表示一个data block
+						/e
+		a		c	d		f	h		i	j		l	m		0	p		r
+		|_______|	|_______|	|_______|	|_______|	|_______|	|_______|
+offset: 0			10			20			30			40			50
+		\
+	     通过index block的seek找到了这个data block,从这里开始向后两个data block找e
+
+index block: 假设restart是2，下面一行表示index block中的一条记录
+0	0	d=>0,10
+	2		g=>10,10    这个应该是基于前一个restart的简写部分，实际不会被检索
+1	3	j=>20,10
+	4		m=>30,10    这个应该是基于前一个restart的简写部分，实际不会被检索
+2	6	p=>40,10
+			s=>50,10    这个应该是基于前一个restart的简写部分，实际不会被检索
+
+前面的 0 1 2是index block的restart的索引，0 3 6 是index block中每个restart偏移量
+
+*/
+
+// 基于sst去查询kv
 func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bool) (rkey, value []byte, err error) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -826,15 +890,19 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 		return
 	}
 
+	// 获取indexBlock
 	indexBlock, rel, err := r.getIndexBlock(true)
 	if err != nil {
 		return
 	}
 	defer rel.Release()
 
+	// 基于indexBlock构造blockIter
 	index := r.newBlockIter(indexBlock, nil, nil, true)
 	defer index.Release()
 
+	// 在index block的记录中寻找此记录中separator大于或者等于要查询的key所在的data block的前一个data block
+	// 此时index 返回的key和value是index block中的第二个记录，指向的data block是d---f
 	if !index.Seek(key) {
 		if err = index.Error(); err == nil {
 			err = ErrNotFound
@@ -842,6 +910,7 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 		return
 	}
 
+	// 拿到d----f这个data block的offset, length
 	dataBH, n := decodeBlockHandle(index.Value())
 	if n == 0 {
 		r.err = r.newErrCorruptedBH(r.indexBH, "bad data block handle")
@@ -849,6 +918,8 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 	}
 
 	// The filter should only used for exact match.
+	// 检查d----f这个data block所在的filter中是否不存在这个key
+	// 如果不存在则直接返回ErrNotFound
 	if filtered && r.filter != nil {
 		filterBlock, frel, ferr := r.getFilterBlock(true)
 		if ferr == nil {
@@ -862,14 +933,19 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 		}
 	}
 
+	// 基于dataBH中的偏移量，构造这个data block的blockIter
+	// 迭代的是一个一个kv
 	data := r.getDataIter(dataBH, nil, r.verifyChecksum, !ro.GetDontFillCache())
+	// 在这个data block的blockIter中，将迭代器移动到找到大于等于这个key的kv上
+	// 如果不存在，则可能是下一个data block中的第一个kv,例如找g
+	// 出现这个问题的原因是在写index block中的记录时separator加了1，并且data block间
 	if !data.Seek(key) {
 		data.Release()
 		if err = data.Error(); err != nil {
 			return
 		}
-
 		// The nearest greater-than key is the first key of the next block.
+		// 继续从下一个 index block中查找key
 		if !index.Next() {
 			if err = index.Error(); err == nil {
 				err = ErrNotFound
@@ -893,6 +969,7 @@ func (r *Reader) find(key []byte, filtered bool, ro *opt.ReadOptions, noValue bo
 		}
 	}
 
+	// 返回data block中找的的kv，这个k可能跟找的ukey相等，也可能大于ukey
 	// Key doesn't use block buffer, no need to copy the buffer.
 	rkey = data.Key()
 	if !noValue {

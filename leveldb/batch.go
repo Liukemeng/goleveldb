@@ -113,6 +113,7 @@ func (b *Batch) appendRec(kt keyType, key, value []byte) {
 	}
 	b.data = data[:o]
 	b.index = append(b.index, index)
+	// note: 这里的8字节加上了在放入memDB时变成InternalKey时的另外8个字节
 	b.internalLen += index.keyLen + index.valueLen + 8
 }
 
@@ -371,6 +372,9 @@ func batchesLen(batches []*Batch) int {
 	return batchLen
 }
 
+// batch写入journal的数据结构是 seq+baches数量+batch中的数据
+// 这个结构就是entry中的data部分
+// todo: seq的作用是？
 func writeBatchesWithHeader(wr io.Writer, batches []*Batch, seq uint64) error {
 	if _, err := wr.Write(encodeBatchHeader(nil, seq, batchesLen(batches))); err != nil {
 		return err

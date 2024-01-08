@@ -28,10 +28,15 @@ func (s *session) pickMemdbLevel(umin, umax []byte, maxLevel int) int {
 	return v.pickMemdbLevel(umin, umax, maxLevel)
 }
 
+// 把frozenMemDB中的kv，按序写入到sst中（构建data block，index block, filter block)
+// 并将flushLevel加入到 sessionRecord.addedTables
 func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (int, error) {
 	// Create sorted table.
 	iter := mdb.NewIterator(nil)
 	defer iter.Release()
+	// 构造sst，并返回tFile
+	// 把kvs写入data block, 同时会把对应的index写入index block，布隆过滤器写入filter block
+	// sst文件刷盘（默认不刷盘）
 	t, n, err := s.tops.createFrom(iter)
 	if err != nil {
 		return 0, err
@@ -45,6 +50,9 @@ func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (i
 	// higher level, thus maximum possible level is always picked, while
 	// overlapping deletion marker pushed into lower level.
 	// See: https://github.com/syndtr/goleveldb/issues/127.
+	// 传进来的是刚刚写入level0层的sst
+	// 如果这个sst跟level 0中其他sst文件不存在重叠，且和level i中的sst文件也不存在冲突，且跟level i+1中的sst文件重叠不超过10个，则返回i
+	// 表示将这个新的sst直接写入level i，在进行table compaction时会进行处理
 	flushLevel := s.pickMemdbLevel(t.imin.ukey(), t.imax.ukey(), maxLevel)
 	rec.addTableFile(flushLevel, t)
 
@@ -53,24 +61,29 @@ func (s *session) flushMemdb(rec *sessionRecord, mdb *memdb.DB, maxLevel int) (i
 }
 
 // Pick a compaction based on current state; need external synchronization.
+// 找出来需要进行table compaction的level和sst文件，构造并返回compaction
 func (s *session) pickCompaction() *compaction {
 	v := s.version()
 
 	var sourceLevel int
 	var t0 tFiles
 	var typ int
+	// 有因为level 0层文件数过多或者level i层文件总量过大引起的compaction的sst
 	if v.cScore >= 1 {
 		sourceLevel = v.cLevel
-		cptr := s.getCompPtr(sourceLevel)
+		cptr := s.getCompPtr(sourceLevel) // imax
 		tables := v.levels[sourceLevel]
+		// 非level 0层，找到需要compaction的那个sst
 		if cptr != nil && sourceLevel > 0 {
 			n := len(tables)
+			// 基于上次进行table compaction的sst的最大key,找到下一个最近的sst索引
 			if i := sort.Search(n, func(i int) bool {
 				return s.icmp.Compare(tables[i].imax, cptr) > 0
 			}); i < n {
 				t0 = append(t0, tables[i])
 			}
 		}
+		// 如果非level 0层，没有需要进行compaction的sst，则把level 0层的sst放入
 		if len(t0) == 0 {
 			t0 = append(t0, tables[0])
 		}
@@ -80,6 +93,7 @@ func (s *session) pickCompaction() *compaction {
 			typ = nonLevel0Compaction
 		}
 	} else {
+		// 剩下的就是因为多次无效查询而引起的seek类型的compaction的sst
 		if p := atomic.LoadPointer(&v.cSeek); p != nil {
 			ts := (*tSet)(p)
 			sourceLevel = ts.level
@@ -90,7 +104,7 @@ func (s *session) pickCompaction() *compaction {
 			return nil
 		}
 	}
-
+	// 创建并返回compaction
 	return newCompaction(s, v, sourceLevel, t0, typ)
 }
 
@@ -133,6 +147,7 @@ func (s *session) getCompactionRange(sourceLevel int, umin, umax []byte, noLimit
 	return newCompaction(s, v, sourceLevel, t0, typ)
 }
 
+// 创建并返回compaction
 func newCompaction(s *session, v *version, sourceLevel int, t0 tFiles, typ int) *compaction {
 	c := &compaction{
 		s:             s,
@@ -140,10 +155,15 @@ func newCompaction(s *session, v *version, sourceLevel int, t0 tFiles, typ int) 
 		typ:           typ,
 		sourceLevel:   sourceLevel,
 		levels:        [2]tFiles{t0, nil},
-		maxGPOverlaps: int64(s.o.GetCompactionGPOverlaps(sourceLevel)),
+		maxGPOverlaps: int64(s.o.GetCompactionGPOverlaps(sourceLevel)), // 10*2MB*1^(level+2) = 20MB
 		tPtrs:         make([]int, len(v.levels)),
 	}
+	// 计算source层和source+1层受此次compaction影响的ssts, imin,imax，并赋值给companion.levels
+	// 计算source+2层受此次compaction影响的sst，并赋值给compaction.gp
+	// 注意对于source是level 0时，一次可能把多个0层的sst整理到1层，但是对于非0层，一次只会把1个ssts整理到下一层
 	c.expand()
+
+	// ？看起来是跟snap相关的信息
 	c.save()
 	return c
 }
@@ -153,16 +173,16 @@ type compaction struct {
 	s *session
 	v *version
 
-	typ           int
-	sourceLevel   int
-	levels        [2]tFiles
-	maxGPOverlaps int64
+	typ           int       // table compaction的三种类型
+	sourceLevel   int       // 本次进行compaction的层
+	levels        [2]tFiles // 0位置是source层需要进行compaction的ssts, 1位置是source+1层被此次compaction影响的ssts
+	maxGPOverlaps int64     // 10*2MB*1^(level+2) = 20MB
 
-	gp                tFiles
+	gp                tFiles // version中下两层（grandparent）中跟此次compaction影响范围的amin，amax重叠的部分
 	gpi               int
 	seenKey           bool
 	gpOverlappedBytes int64
-	imin, imax        internalKey
+	imin, imax        internalKey // source层进行compaction的ssts中，最小和最大的key
 	tPtrs             []int
 	released          bool
 
@@ -194,18 +214,26 @@ func (c *compaction) release() {
 }
 
 // Expand compacted tables; need external synchronization.
+// 计算source层和source+1层受此次compaction影响的ssts, imin,imax，并赋值给companion.levels
+// 计算source+2层受此次compaction影响的sst，并赋值给compaction.gp
+// 注意对于source是level 0时，一次可能把多个0层的sst整理到1层，但是对于非0层，一次只会把1个ssts整理到下一层
 func (c *compaction) expand() {
-	limit := int64(c.s.o.GetCompactionExpandLimit(c.sourceLevel))
+	// 默认50MB
+	limit := int64(c.s.o.GetCompactionExpandLimit(c.sourceLevel)) // 25*（2MB*1^level）= 50MB*1^level = 50MB
+	// version中需要进行compaction的source层和source+1层的tFiles
 	vt0 := c.v.levels[c.sourceLevel]
 	vt1 := tFiles{}
 	if level := c.sourceLevel + 1; level < len(c.v.levels) {
 		vt1 = c.v.levels[level]
 	}
 
+	// compaction中需要进行compaction的source层和source+1层的tFiles
 	t0, t1 := c.levels[0], c.levels[1]
 	imin, imax := t0.getRange(c.s.icmp)
 
 	// For non-zero levels, the ukey can't hop across tables at all.
+	// 对0层某个sst进行compaction的话，因为sst间的key有重叠，需要检索并返回0层中跟umin和umax重叠的所有sst文件
+	// 并基于新的ssts，算出来新的imin, imax
 	if c.sourceLevel == 0 {
 		// We expand t0 here just incase ukey hop across tables.
 		t0 = vt0.getOverlaps(t0, c.s.icmp, imin.ukey(), imax.ukey(), c.sourceLevel == 0)
@@ -213,12 +241,18 @@ func (c *compaction) expand() {
 			imin, imax = t0.getRange(c.s.icmp)
 		}
 	}
+	// source+1层跟imin,imax重叠的部分
 	t1 = vt1.getOverlaps(t1, c.s.icmp, imin.ukey(), imax.ukey(), false)
 	// Get entire range covered by compaction.
+	// 两层部分sst合并后的新的范围
 	amin, amax := append(t0, t1...).getRange(c.s.icmp)
 
 	// See if we can grow the number of inputs in "sourceLevel" without
 	// changing the number of "sourceLevel+1" files we pick up.
+	// 如果source层和source+1层有重叠部分
+	// 这里会基于两层合并后新的范围（amin, amax），去source层判断一下是不是有更大的重叠范围
+	// 如果有更大的范围，但是两层重叠部分ssts的大小没超过limit，则会尝试把source层更多的ssts compaction到source+1层
+	// 但是只有在不增加source+1层影响范围的情况下才会实际这么做
 	if len(t1) > 0 {
 		exp0 := vt0.getOverlaps(nil, c.s.icmp, amin.ukey(), amax.ukey(), c.sourceLevel == 0)
 		if len(exp0) > len(t0) && t1.size()+exp0.size() < limit {
@@ -237,10 +271,13 @@ func (c *compaction) expand() {
 
 	// Compute the set of grandparent files that overlap this compaction
 	// (parent == sourceLevel+1; grandparent == sourceLevel+2)
+	// version中下两层中跟此次compaction影响范围的amin，amax重叠的部分
 	if level := c.sourceLevel + 2; level < len(c.v.levels) {
 		c.gp = c.v.levels[level].getOverlaps(c.gp, c.s.icmp, amin.ukey(), amax.ukey(), false)
 	}
 
+	// 将source层和source+1层受影响的ssts加入到compaction.levels中
+	// 并更新最小和最大key
 	c.levels[0], c.levels[1] = t0, t1
 	c.imin, c.imax = imin, imax
 }
@@ -290,6 +327,8 @@ func (c *compaction) shouldStopBefore(ikey internalKey) bool {
 }
 
 // Creates an iterator.
+// 基于source层和source+1层中需要compaction的sst，构造一个mergedIterator
+// 该迭代器可以把多个sst中的kv，整体按序迭代出来
 func (c *compaction) newIterator() iterator.Iterator {
 	// Creates iterator slice.
 	icap := len(c.levels)
@@ -309,6 +348,9 @@ func (c *compaction) newIterator() iterator.Iterator {
 		ro.Strict |= opt.StrictReader
 	}
 
+	// 基于source层和source+1层中需要compaction的sst
+	// 给每个sst构造indexedIterator迭代器，indexedIterator按序迭代sst中每个data block中的kv
+	// 注意，sst内的k本身就是按序的
 	for i, tables := range c.levels {
 		if len(tables) == 0 {
 			continue
@@ -325,5 +367,7 @@ func (c *compaction) newIterator() iterator.Iterator {
 		}
 	}
 
+	// 基于每个sst的迭代器，构造一个mergedIterator
+	// 该迭代器可以把多个sst中的kv，整体按序迭代出来
 	return iterator.NewMergedIterator(its, c.s.icmp, strict)
 }

@@ -52,9 +52,9 @@ type session struct {
 	manifestWriter storage.Writer
 	manifestFd     storage.FileDesc
 
-	stCompPtrs  []internalKey // compaction pointers; need external synchronization
+	stCompPtrs  []internalKey // compaction pointers; need external synchronization    index表示的是level，记录上一次此level层中进行compaction的sst的最大key，下一次从此key之后的首个文件进行处理
 	stVersion   *version      // current version
-	ntVersionID int64         // next version id to assign
+	ntVersionID int64         // next version id to assign    newVersion时候+1
 	refCh       chan *vTask
 	relCh       chan *vTask
 	deltaCh     chan *vDelta
@@ -208,11 +208,15 @@ func (s *session) recover() (err error) {
 }
 
 // Commit session; need external synchronization.
+// 把session和new version中的信息更新到sessionRecord中, 并把sessionRecord写入manifest
+// 并用new version更新session中的current version
 func (s *session) commit(r *sessionRecord, trivial bool) (err error) {
+	// 获取当前的version
 	v := s.version()
 	defer v.release()
 
 	// spawn new version based on current version
+	// 根据sessionRecord计算并返回新的version，然后也会计算出下一次进行table compaction的level
 	nv := v.spawn(r, trivial)
 
 	// abandon useless version id to prevent blocking version processing loop.
@@ -223,8 +227,11 @@ func (s *session) commit(r *sessionRecord, trivial bool) (err error) {
 		}
 	}()
 
+	// 把session和new version中的信息更新到sessionRecord中
 	if s.manifest == nil {
 		// manifest journal writer not yet created, create one
+		// 把new version中的addedTables信息和session中的recJournalNum，recSeqNum，comparer等信息更新到sessionRecord中
+		// 并把sessionRecord写入manifest
 		err = s.newManifest(r, nv)
 	} else if s.manifest.Size() >= s.o.GetMaxManifestFileSize() {
 		// pass nil sessionRecord to avoid over-reference table file
@@ -234,6 +241,7 @@ func (s *session) commit(r *sessionRecord, trivial bool) (err error) {
 	}
 
 	// finally, apply new version if no error rise
+	// 用新的version更新current version
 	if err == nil {
 		s.setVersion(r, nv)
 	}

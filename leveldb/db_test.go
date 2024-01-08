@@ -3000,3 +3000,25 @@ func TestDB_GracefulClose(t *testing.T) {
 	iter.Release()
 	closeWait.Wait()
 }
+
+func TestName(t *testing.T) {
+	ch0 := make(chan int)
+	ch1 := make(chan int, 1)
+
+	go func() {
+		for {
+			select {
+			case c0 := <-ch0:
+				fmt.Printf("ch0 %d\n", c0)
+			case c1 := <-ch1:
+				fmt.Printf("ch1 %d\n", c1)
+			}
+		}
+	}()
+
+	select {
+	case ch0 <- 0:
+	case ch1 <- 1:
+	}
+	time.Sleep(20 * time.Second)
+}

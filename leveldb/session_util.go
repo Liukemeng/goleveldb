@@ -370,6 +370,7 @@ func (s *session) fillRecord(r *sessionRecord, snapshot bool) {
 			r.setSeqNum(s.stSeqNum)
 		}
 
+		//
 		for level, ik := range s.stCompPtrs {
 			if ik != nil {
 				r.addCompPtr(level, ik)
@@ -401,6 +402,8 @@ func (s *session) recordCommited(rec *sessionRecord) {
 }
 
 // Create a new manifest file; need external synchronization.
+// 把new version中的addedTables信息和session中的recJournalNum，recSeqNum，comparer等信息更新到sessionRecord中
+// 并把sessionRecord写入manifest
 func (s *session) newManifest(rec *sessionRecord, v *version) (err error) {
 	fd := storage.FileDesc{Type: storage.TypeManifest, Num: s.allocFileNum()}
 	writer, err := s.stor.Create(fd)
@@ -416,7 +419,9 @@ func (s *session) newManifest(rec *sessionRecord, v *version) (err error) {
 	if rec == nil {
 		rec = &sessionRecord{}
 	}
+	// 给sessionRecord增加 recJournalNum，recSeqNum，comparer等信息
 	s.fillRecord(rec, true)
+	// 给sessionRecord增加addedTables
 	v.fillRecord(rec)
 
 	defer func() {

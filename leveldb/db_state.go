@@ -23,7 +23,7 @@ var (
 type memDB struct {
 	db *DB
 	*memdb.DB
-	ref int32
+	ref int32 // 这个引用计数的作用？
 }
 
 func (m *memDB) getref() int32 {
@@ -87,7 +87,7 @@ func (db *DB) mpoolGet(n int) *memDB {
 	default:
 	}
 	if mdb == nil || mdb.Capacity() < n {
-		mdb = memdb.New(db.s.icmp, maxInt(db.s.o.GetWriteBuffer(), n))
+		mdb = memdb.New(db.s.icmp, maxInt(db.s.o.GetWriteBuffer(), n)) // 4M, batch size
 	}
 	return &memDB{
 		db: db,

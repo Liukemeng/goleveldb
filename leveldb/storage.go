@@ -7,6 +7,7 @@ import (
 
 type iStorage struct {
 	storage.Storage
+	// read write的字节数
 	read  uint64
 	write uint64
 }

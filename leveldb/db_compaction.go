@@ -258,6 +258,8 @@ func (db *DB) compactionExitTransact() {
 	panic(errCompactionTransactExiting)
 }
 
+// 把session和new version中的信息更新到sessionRecord中, 并把sessionRecord写入manifest
+// 并用new version更新session中的current version
 func (db *DB) compactionCommit(name string, rec *sessionRecord) {
 	db.compCommitLk.Lock()
 	defer db.compCommitLk.Unlock() // Defer is necessary.
@@ -266,6 +268,12 @@ func (db *DB) compactionCommit(name string, rec *sessionRecord) {
 	}, nil)
 }
 
+// 把frozenMemDB中的kv，按序写入到sst中（构建data block，index block, filter block)
+// 并将flushLevel加入到 sessionRecord.addedTables
+// 把session和new version中的信息更新到sessionRecord中, 并把sessionRecord写入manifest
+// 并用new version更新session中的current version
+// 清除frozen memdb和对应的journal
+// 非阻塞式的触发table compaction
 func (db *DB) memCompaction() {
 	mdb := db.getFrozenMem()
 	if mdb == nil {
@@ -284,6 +292,8 @@ func (db *DB) memCompaction() {
 	}
 
 	// Pause table compaction.
+	// 如果正在进行table compaction，需要等table compaction进行完后，才能再进行mem compaction
+	// 如果正好要准备进行table compaction，则先让其停止，先进行mem compaction
 	resumeC := make(chan struct{})
 	select {
 	case db.tcompPauseC <- (chan<- struct{})(resumeC):
@@ -302,11 +312,14 @@ func (db *DB) memCompaction() {
 
 	// Generate tables.
 	db.compactionTransactFunc("memdb@flush", func(cnt *compactionTransactCounter) (err error) {
+		// 把frozenMemDB中的kv，按序写入到sst中（构建data block，index block, filter block)
+		// 并将flushLevel加入到 sessionRecord.addedTables
 		stats.startTimer()
 		flushLevel, err = db.s.flushMemdb(rec, mdb.DB, db.memdbMaxLevel)
 		stats.stopTimer()
 		return
 	}, func() error {
+		// 创建sst失败，则撤销增加的sst
 		for _, r := range rec.addedTables {
 			db.logf("memdb@flush revert @%d", r.num)
 			if err := db.s.stor.Remove(storage.FileDesc{Type: storage.TypeTable, Num: r.num}); err != nil {
@@ -316,10 +329,13 @@ func (db *DB) memCompaction() {
 		return nil
 	})
 
+	// 给record.seqNum赋值
 	rec.setJournalNum(db.journalFd.Num)
 	rec.setSeqNum(db.frozenSeq)
 
 	// Commit.
+	// 把session和new version中的信息更新到sessionRecord中, 并把sessionRecord写入manifest
+	// 并用new version更新session中的current version
 	stats.startTimer()
 	db.compactionCommit("memdb", rec)
 	stats.stopTimer()
@@ -334,6 +350,7 @@ func (db *DB) memCompaction() {
 	atomic.AddUint32(&db.memComp, 1)
 
 	// Drop frozen memdb.
+	// 清除frozen memdb和对应的journal
 	db.dropFrozenMem()
 
 	// Resume table compaction.
@@ -347,6 +364,7 @@ func (db *DB) memCompaction() {
 	}
 
 	// Trigger table compaction.
+	// 非阻塞式的触发table compaction
 	db.compTrigger(db.tcompCmdC)
 }
 
@@ -374,6 +392,7 @@ type tableCompactionBuilder struct {
 	tw *tWriter
 }
 
+// 把数据写入data block，并将索引和key写入index block和filer block
 func (b *tableCompactionBuilder) appendKV(key, value []byte) error {
 	// Create new table if not already.
 	if b.tw == nil {
@@ -397,6 +416,7 @@ func (b *tableCompactionBuilder) appendKV(key, value []byte) error {
 	}
 
 	// Write key/value into table.
+	// 把数据写入data block，并将索引和key写入index block和filer block
 	return b.tw.append(key, value)
 }
 
@@ -405,10 +425,12 @@ func (b *tableCompactionBuilder) needFlush() bool {
 }
 
 func (b *tableCompactionBuilder) flush() error {
+	// sst文件刷盘（默认不刷盘），并构建tFile
 	t, err := b.tw.finish()
 	if err != nil {
 		return err
 	}
+	// 将加入到source+1层的tFile文件添加进sessionRecord中
 	b.rec.addTableFile(b.c.sourceLevel+1, t)
 	b.stat1.write += t.size
 	b.s.logf("table@build created L%d@%d N·%d S·%s %q:%q", b.c.sourceLevel+1, t.fd.Num, b.tw.tw.EntriesLen(), shortenb(t.size), t.imin, t.imax)
@@ -426,6 +448,10 @@ func (b *tableCompactionBuilder) cleanup() error {
 	return nil
 }
 
+// 基于source层和source+1层中需要compaction的sst，构造一个mergedIterator
+// 把数据写入新的data block，并将索引和key写入index block和filer block
+// sst文件刷盘（默认不刷盘），并构建tFile
+// 将加入到source+1层的tFile文件添加进sessionRecord中
 func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) (err error) {
 	snapResumed := b.snapIter > 0
 	hasLastUkey := b.snapHasLastUkey // The key might has zero length, so this is necessary.
@@ -449,6 +475,8 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) (err error)
 	b.stat1.startTimer()
 	defer b.stat1.stopTimer()
 
+	// 基于source层和source+1层中需要compaction的sst，构造一个mergedIterator
+	// 该迭代器可以把多个sst中的kv，整体按序迭代出来
 	iter := b.c.newIterator()
 	defer iter.Release()
 	for i := 0; iter.Next(); i++ {
@@ -466,6 +494,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) (err error)
 			snapResumed = false
 		}
 
+		// 获取key
 		ikey := iter.Key()
 		ukey, seq, kt, kerr := parseInternalKey(ikey)
 
@@ -526,6 +555,7 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) (err error)
 			b.kerrCnt++
 		}
 
+		// 把数据写入data block，并将索引和key写入index block和filer block
 		if err := b.appendKV(ikey, iter.Value()); err != nil {
 			return err
 		}
@@ -536,6 +566,8 @@ func (b *tableCompactionBuilder) run(cnt *compactionTransactCounter) (err error)
 	}
 
 	// Finish last table.
+	// sst文件刷盘（默认不刷盘），并构建tFile
+	// 将加入到source+1层的tFile文件添加进sessionRecord中
 	if b.tw != nil && !b.tw.empty() {
 		return b.flush()
 	}
@@ -552,12 +584,19 @@ func (b *tableCompactionBuilder) revert() error {
 	return nil
 }
 
+// table compaction的核心处理流程
 func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 	defer c.release()
 
 	rec := &sessionRecord{}
 	rec.addCompPtr(c.sourceLevel, c.imax)
 
+	// ppt60中的情况
+	// source层只有1个待compaction的sst
+	// source+1层没有重叠的文件
+	// source+2层跟source层重叠的文件大小不超过20MB
+	// 则直接将source层的那个sst移动到source+1层
+	// 就return了
 	if !noTrivial && c.trivial() {
 		t := c.levels[0][0]
 		db.logf("table@move L%d@%d -> L%d", c.sourceLevel, t.fd.Num, c.sourceLevel+1)
@@ -567,6 +606,7 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 		return
 	}
 
+	// source层和source+1层受本次compaction影响，需要删除的ssts
 	var stats [2]cStatStaging
 	for i, tables := range c.levels {
 		for _, t := range tables {
@@ -584,14 +624,20 @@ func (db *DB) tableCompaction(c *compaction, noTrivial bool) {
 		s:         db.s,
 		c:         c,
 		rec:       rec,
-		stat1:     &stats[1],
-		minSeq:    minSeq,
+		stat1:     &stats[1], // source+1层需要read的size
+		minSeq:    minSeq,    // snap中最小的seq
 		strict:    db.s.o.GetStrict(opt.StrictCompaction),
-		tableSize: db.s.o.GetCompactionTableSize(c.sourceLevel + 1),
+		tableSize: db.s.o.GetCompactionTableSize(c.sourceLevel + 1), // 2MB
 	}
+	// 基于source层和source+1层中需要compaction的sst，构造一个mergedIterator
+	// 把数据写入新的data block，并将索引和key写入index block和filer block
+	// sst文件刷盘（默认不刷盘），并构建tFile
+	// 将加入到source+1层的tFile文件添加进sessionRecord中
 	db.compactionTransact("table@build", b)
 
 	// Commit.
+	// 把session和new version中的信息更新到sessionRecord中, 并把sessionRecord写入manifest
+	// 并用new version更新session中的current version
 	stats[1].startTimer()
 	db.compactionCommit("table", rec)
 	stats[1].stopTimer()
@@ -652,7 +698,10 @@ func (db *DB) tableRangeCompaction(level int, umin, umax []byte) error {
 }
 
 func (db *DB) tableAutoCompaction() {
+	// 找出来需要进行table compaction的level和sst文件，构造并返回compaction
 	if c := db.s.pickCompaction(); c != nil {
+		// table compaction的核心处理流程，把source和source+1层的sst文件合并，并写入到source+1层
+		// 然后把sessionRecord写入manifest，并用new version更新session中的current version
 		db.tableCompaction(c, false)
 	}
 }
@@ -720,6 +769,7 @@ func (db *DB) compTrigger(compC chan<- cCmd) {
 }
 
 // This will trigger auto compaction and/or wait for all compaction to be done.
+// 阻塞式进行一次minor compaction
 func (db *DB) compTriggerWait(compC chan<- cCmd) (err error) {
 	ch := make(chan error)
 	defer close(ch)
@@ -785,7 +835,7 @@ func (db *DB) mCompaction() {
 			case cAuto:
 				db.memCompaction()
 				x.ack(nil)
-				x = nil
+				x = nil // todo 为什么置为nil?
 			default:
 				panic("leveldb: unknown command")
 			}
@@ -818,8 +868,10 @@ func (db *DB) tCompaction() {
 	}()
 
 	for {
+		// 首先有积分大于1的需要进行table compaction
 		if db.tableNeedCompaction() {
 			select {
+			// 然后有地方触发table compaction
 			case x = <-db.tcompCmdC:
 			case ch := <-db.tcompPauseC:
 				db.pauseCompaction(ch)
@@ -829,6 +881,7 @@ func (db *DB) tCompaction() {
 			default:
 			}
 			// Resume write operation as soon as possible.
+			// 恢复因为GetWriteL0PauseTrigger（12）触发的写阻塞
 			if len(waitQ) > 0 && db.resumeWrite() {
 				for i := range waitQ {
 					waitQ[i].ack(nil)
@@ -851,6 +904,7 @@ func (db *DB) tCompaction() {
 				return
 			}
 		}
+		// 开始进行table compaction
 		if x != nil {
 			switch cmd := x.(type) {
 			case cAuto:

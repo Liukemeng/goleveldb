@@ -21,12 +21,15 @@ type IteratorIndexer interface {
 	Get() Iterator
 }
 
+// 基于sst层面的迭代器，最终迭代的是sst中每个data block中的kv
+// 包含了一个index，基于index block构造的indexIter迭代器，这个迭代器用于按序迭代sst中每一个data block
+// 包含了一个data，缓存当前正在被迭代的data block的迭代器
 type indexedIterator struct {
 	util.BasicReleaser
-	index  IteratorIndexer
+	index  IteratorIndexer // indexIter: index block的迭代器，用于构造每个data block的blockIter，迭代每个kv
 	strict bool
 
-	data Iterator
+	data Iterator // blockIter：缓存根据index迭代器构造的正在迭代的data block的blockIter，通过Vale拿到kv值
 	err  error
 	errf func(err error)
 }

@@ -111,6 +111,16 @@ Block trailer:
     | restart point 1 |       ....      | restart point n | restart points len (4-bytes) |
     +-----------------+-----------------+-----------------+------------------------------+
 
+data block的完整结构：
+      + restart point                 + restart point 				 + restart offset
+     /                               /								/
+    +---------------+---------------+---------------+---------------+-----------------+-----------------+-----------------+------------------------------+
+    | block entry 1 | block entry 2 |      ...      | block entry n | restart point 1 |       ....      | restart point n | restart points len (4-bytes) |
+    +---------------+---------------+---------------+---------------+-----------------+-----------------+-----------------+------------------------------+
+data block压缩后的结构
+	+---------------+------------------------+---------------+
+    |compressed data| compress type(1-bytes) | CRC(4-bytes)  |
+    +---------------+------------------------+---------------+
 
 NOTE: All fixed-length integer are little-endian.
 */

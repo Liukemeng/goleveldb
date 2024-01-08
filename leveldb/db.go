@@ -31,13 +31,13 @@ import (
 // DB is a LevelDB database.
 type DB struct {
 	// Need 64-bit alignment.
-	seq uint64
+	seq uint64 // 写入的kv数量，依次递增，写入memDB和wal时就进行了更新
 
 	// Stats. Need 64-bit alignment.
 	cWriteDelay            int64 // The cumulative duration of write delays
 	cWriteDelayN           int32 // The cumulative number of write delays
-	inWritePaused          int32 // The indicator whether write operation is paused by compaction
-	aliveSnaps, aliveIters int32
+	inWritePaused          int32 // The indicator whether write operation is paused by compaction, 1 表示正在进行compaction，write会被阻塞，0表示没有进行compaction
+	aliveSnaps, aliveIters int32 //
 
 	// Compaction statistic
 	memComp       uint32 // The cumulative number of memory compaction
@@ -50,33 +50,33 @@ type DB struct {
 
 	// MemDB.
 	memMu           sync.RWMutex
-	memPool         chan *memdb.DB
-	mem, frozenMem  *memDB
-	journal         *journal.Writer
-	journalWriter   storage.Writer
-	journalFd       storage.FileDesc
+	memPool         chan *memdb.DB   // memDB的内存池, 容量是1
+	mem, frozenMem  *memDB           // memDB
+	journal         *journal.Writer  // 包装journalWriter，构造的业务层journal，写入时会写checksum/length等信息
+	journalWriter   storage.Writer   // journal对应的实际writer，基于文件句柄中的num创建的文件writer
+	journalFd       storage.FileDesc // journal的文件句柄
 	frozenJournalFd storage.FileDesc
-	frozenSeq       uint64
+	frozenSeq       uint64 // 创建新的memDB时，将DB.seq赋值给frozenSeq这个字段
 
 	// Snapshot.
 	snapsMu   sync.Mutex
 	snapsList *list.List
 
 	// Write.
-	batchPool    sync.Pool
-	writeMergeC  chan writeMerge
-	writeMergedC chan bool
-	writeLockC   chan struct{}
-	writeAckC    chan error
+	batchPool    sync.Pool       // oruBatch的内存池，put 时应用
+	writeMergeC  chan writeMerge // merge写的chan
+	writeMergedC chan bool       // merged完成的信号
+	writeLockC   chan struct{}   // 容量1，不会阻塞
+	writeAckC    chan error      // merged完成的结果
 	writeDelay   time.Duration
 	writeDelayN  int
 	tr           *Transaction
 
 	// Compaction.
 	compCommitLk     sync.Mutex
-	tcompCmdC        chan cCmd
-	tcompPauseC      chan chan<- struct{}
-	mcompCmdC        chan cCmd
+	tcompCmdC        chan cCmd            // table compaction 执行的信号chan
+	tcompPauseC      chan chan<- struct{} // 用于阻塞table compaction执行的信号chan
+	mcompCmdC        chan cCmd            // mem compaction 执行的信号chan
 	compErrC         chan error
 	compPerErrC      chan error
 	compErrSetC      chan error
@@ -329,6 +329,8 @@ func recoverTable(s *session, o *opt.Options) error {
 		}()
 
 		// Copy entries.
+		// 把kv写入data block，并构建filter block
+		// 如果有pendingBH就写入index data中
 		tw := table.NewWriter(writer, o, nil, 0)
 		for iter.Next() {
 			key := iter.Key()
@@ -786,7 +788,7 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 			return append([]byte(nil), mv...), me
 		}
 	}
-
+	// 从memDB中找
 	em, fm := db.getMems()
 	for _, m := range [...]*memDB{em, fm} {
 		if m == nil {
@@ -799,6 +801,7 @@ func (db *DB) get(auxm *memdb.DB, auxt tFiles, key []byte, seq uint64, ro *opt.R
 		}
 	}
 
+	// 获取当前最新的version
 	v := db.s.version()
 	value, cSched, err := v.get(auxt, ikey, ro, false)
 	v.release()
@@ -864,6 +867,7 @@ func (db *DB) Get(key []byte, ro *opt.ReadOptions) (value []byte, err error) {
 		return
 	}
 
+	// 基于最新的seq，获取一个snapshot
 	se := db.acquireSnapshot()
 	defer db.releaseSnapshot(se)
 	return db.get(nil, nil, key, se.seq, ro)
@@ -920,6 +924,7 @@ func (db *DB) NewIterator(slice *util.Range, ro *opt.ReadOptions) iterator.Itera
 // content of snapshot are guaranteed to be consistent.
 //
 // The snapshot must be released after use, by calling Release method.
+// 上层调用者，可以直接获取一个snap
 func (db *DB) GetSnapshot() (*Snapshot, error) {
 	if err := db.ok(); err != nil {
 		return nil, err
@@ -931,6 +936,7 @@ func (db *DB) GetSnapshot() (*Snapshot, error) {
 // GetProperty returns value of the given property name.
 //
 // Property names:
+//
 //	leveldb.num-files-at-level{n}
 //		Returns the number of files at level 'n'.
 //	leveldb.stats

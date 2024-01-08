@@ -25,6 +25,7 @@
 // Neither Readers or Writers are safe to use concurrently.
 //
 // Example code:
+//
 //	func read(r io.Reader) ([]string, error) {
 //		var ss []string
 //		journals := journal.NewReader(r, nil, true, true)
@@ -176,7 +177,11 @@ func (r *Reader) corrupt(n int, reason string, skip bool) error {
 // next block into the buffer if necessary.
 func (r *Reader) nextChunk(first bool) error {
 	for {
+		// 1、最开始初始化reader时，i j n都是0，第一次不会走这个if
+		// 3、通过for循环，在读取一个block后，i 0, j 0, n block的数据尺寸即blockSize，则会走到这个if判断
+		// 走到这里会校验block的checksum是否有效，并将i j移动到entry的payload处，方便外层方法读取buf[i:j]，并检测这个block是否是最后一个entry
 		if r.j+headerSize <= r.n {
+			// 这个block
 			checksum := binary.LittleEndian.Uint32(r.buf[r.j+0 : r.j+4])
 			length := binary.LittleEndian.Uint16(r.buf[r.j+4 : r.j+6])
 			chunkType := r.buf[r.j+6]
@@ -193,6 +198,8 @@ func (r *Reader) nextChunk(first bool) error {
 				r.j = r.n
 				return r.corrupt(unprocBlock, fmt.Sprintf("invalid chunk type %#x", chunkType), false)
 			}
+			// 移动i到这个block的payload起点
+			// 移动j到block的尾部
 			r.i = r.j + headerSize
 			r.j = r.j + headerSize + int(length)
 			if r.j > r.n {
@@ -212,7 +219,9 @@ func (r *Reader) nextChunk(first bool) error {
 				// Report the error, but skip it.
 				return r.corrupt(chunkLength, "orphan chunk", true)
 			}
+			// 判断是否是最后一个entry
 			r.last = chunkType == fullChunkType || chunkType == lastChunkType
+			// 读取一个block后的出口
 			return nil
 		}
 
@@ -226,6 +235,7 @@ func (r *Reader) nextChunk(first bool) error {
 		}
 
 		// Read block.
+		// 2、随后走到这里，读取一个block
 		n, err := io.ReadFull(r.r, r.buf[:])
 		if err != nil && err != io.EOF && err != io.ErrUnexpectedEOF {
 			return err
@@ -245,6 +255,7 @@ func (r *Reader) nextChunk(first bool) error {
 // more journals. The reader returned becomes stale after the next Next call,
 // and should no longer be used. If strict is false, the reader will returns
 // io.ErrUnexpectedEOF error when found corrupted journal.
+// 读取一个有效的block，构造出singleReader后返回出去
 func (r *Reader) Next() (io.Reader, error) {
 	r.seq++
 	if r.err != nil {
@@ -252,6 +263,8 @@ func (r *Reader) Next() (io.Reader, error) {
 	}
 	r.i = r.j
 	for {
+		// 读取一个有效的block
+		// 读取后会把j指向到下一个block
 		if err := r.nextChunk(true); err == nil {
 			break
 		} else if err != errSkip {
@@ -284,6 +297,8 @@ type singleReader struct {
 	err error
 }
 
+// Read 读取一个block到p
+// 往往是先调用Next再调用Read
 func (x *singleReader) Read(p []byte) (int, error) {
 	r := x.r
 	if r.seq != x.seq {
@@ -295,6 +310,7 @@ func (x *singleReader) Read(p []byte) (int, error) {
 	if r.err != nil {
 		return 0, r.err
 	}
+	// 这里限定了只会读取一个block
 	for r.i == r.j {
 		if r.last {
 			return 0, io.EOF
@@ -469,6 +485,7 @@ func (w *Writer) Reset(writer io.Writer) (err error) {
 
 // Next returns a writer for the next journal. The writer returned becomes stale
 // after the next Close, Flush or Next call, and should no longer be used.
+// 为上一个entry构造header，然后准备好下一个entry写入的位置
 func (w *Writer) Next() (io.Writer, error) {
 	w.seq++
 	if w.err != nil {
@@ -508,6 +525,8 @@ type singleWriter struct {
 	seq int
 }
 
+// 往往先调用Next再调用Write
+// 一个block 是严格的32KB大小的数据，这个block装不下p后，再开一个block
 func (x singleWriter) Write(p []byte) (int, error) {
 	w := x.w
 	if w.seq != x.seq {

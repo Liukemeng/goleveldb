@@ -30,15 +30,16 @@ type dbIter struct {
 	p          *DB
 	slice      *util.Range
 	node       int
-	forward    bool
+	forward    bool // 表明是否已经开始向后迭代
 	key, value []byte
 	err        error
 }
 
+// 找到node对应的kv,补充进dbIter.key value
 func (i *dbIter) fill(checkStart, checkLimit bool) bool {
 	if i.node != 0 {
-		n := i.p.nodeData[i.node]
-		m := n + i.p.nodeData[i.node+nKey]
+		n := i.p.nodeData[i.node]          // key 的起始地址， 0
+		m := n + i.p.nodeData[i.node+nKey] // key 的终止地址， 1
 		i.key = i.p.kvData[n:m]
 		if i.slice != nil {
 			switch {
@@ -178,26 +179,116 @@ const (
 	nNext
 )
 
+/*
+
+
+k1-> 1 添加进  12层；
+k3-> 3 添加进  9层；
+k2-> 2 添加进  11层；
+
+初始时：
+kvData:
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15	16	17	18	19
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+nodeData:
+/第一个node是header，index部分是0表示是尾节点
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|0	|0	|0	|12	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+prevNode:
+0	1	2	3	4	5	6	7	8	9	10	11
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+
+
+一: put k1->1 to  12 levels
+kvData:
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15	16	17	18	19
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|k	|1	|1	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+nodeData:
+/第一个node是header
+																/第二个node
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15	16	17	18	19	20	21	22	23	24	25	26	27	28	29	30	31
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---
+|0	|0	|0	|12	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|0	|2	|1	|12	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---
+prevNode:
+0	1	2	3	4	5	6	7	8	9	10	11
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+
+二: put k3->3 to  9 levels
+kvData:
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15	16	17	18	19
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|k	|1	|1	|k	|3	|3	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+nodeData:
+/第一个node是header
+																/第二个node k1
+																																/第三个node k3
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15	16	17	18	19	20	21	22	23	24	25	26	27	28	29	30	31	32	33	34	35	36	37	38	39	40	41	42	43	44
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|0	|0	|0	|12	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|0	|2	|1	|12	|32	|32	|32	|32	|32	|32	|32	|32	|32	|0	|0	|0	|6	|2	|1	|9	|0	|0	|0	|0	|0	|0	|0	|0	|0
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+prevNode:  在findGE中进行的更新
+0	1	2	3	4	5	6	7	8	9	10	11
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+
+三: put k2->2 to  11 levels
+kvData:
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15	16	17	18	19
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|k	|1	|1	|k	|3	|3	|k	|2	|2	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|	|
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+nodeData:
+/第一个node是header
+																/第二个node k1
+																																/第三个node k3
+																																													/第四个node k2
+0	1	2	3	4	5	6	7	8	9	10	11	12	13	14	15	16	17	18	19	20	21	22	23	24	25	26	27	28	29	30	31	32	33	34	35	36	37	38	39	40	41	42	43	44	45	46	47	48	49	50	51	52	53	54	55	56	57	58	56
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---	---	--- ---	--- ---	--- ---	--- ---	---	--- ---	---
+|0	|0	|0	|12	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|16	|0	|2	|1	|12	|32	|32	|32	|32	|32	|32	|32	|32	|32	|45	|45	|0	|6	|2	|1	|9	|45	|45	|45	|45	|45	|45	|45	|45	|45	|9	|2	|1	|11	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0	|0
+---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	--- ---	---	--- ---	---	--- ---	--- ---	--- ---	--- ---	---	--- ---	---
+prevNode:  在findGE中进行的更新
+0	1	2	3	4	5	6	7	8	9	10	11
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+|32	|32	|32	|32	|32	|32	|32	|32	|32	|16	|16	|16
+---	--- ---	--- ---	--- ---	--- ---	--- ---	---
+
+*/
+
 // DB is an in-memory key/value database.
+// memDB
 type DB struct {
 	cmp comparer.BasicComparer
 	rnd *rand.Rand
 
 	mu     sync.RWMutex
-	kvData []byte
+	kvData []byte // 记录实际的kv
 	// Node data:
-	// [0]         : KV offset
-	// [1]         : Key length
-	// [2]         : Value length
-	// [3]         : Height
-	// [3..height] : Next nodes
-	nodeData  []int
-	prevNode  [tMaxHeight]int
-	maxHeight int
-	n         int
-	kvSize    int
+	// [0]         : KV offset      记录这个kv在kvData中的起始偏移量
+	// [1]         : Key length     记录这个kv在kvData中key的长度
+	// [2]         : Value length   记录这个kv在kvData中value的长度
+	// [3]         : Height         本节点的所处的高度，从0开始，0——11
+	// [3..height] : Next nodes     用来存储每一层对应的下一个节点的【索引】
+	nodeData  []int           // 跳表，一个节点包括了上述注释中的所有内容。
+	prevNode  [tMaxHeight]int // 当前检索的key所在node在每一层的前一个node，属于临时变量，在find时根据情况进行更新
+	maxHeight int             // 跳表最大高度
+	n         int             // 跳表的节点总数
+	kvSize    int             // kv占用的总空间数
 }
 
+// 跳表特性，确保分布在在第1、2、3、4层的概率分别是1/2，1/4，1/8，1/16
 func (p *DB) randHeight() (h int) {
 	const branching = 4
 	h = 1
@@ -208,28 +299,39 @@ func (p *DB) randHeight() (h int) {
 }
 
 // Must hold RW-lock if prev == true, as it use shared prevNode slice.
+// 从最高层开始找，一直找到最底层，然后返回比key大的下一个node在nodeData中的索引；
+// 注意，如果prev是true，则在找的过程中用prevNode记录此key形成的node，在每层高度的前置node（索引）
 func (p *DB) findGE(key []byte, prev bool) (int, bool) {
 	node := 0
+	// 最开始maxHeight是1
 	h := p.maxHeight - 1
 	for {
-		next := p.nodeData[node+nNext+h]
+		// 从header节点中找到最高层对应的下一个节点，也就是索引15那个位置的值，next是16， 32
+		next := p.nodeData[node+nNext+h] // put k1: 0+4+0=4; put k3: 0+4+11=15, 16+4+11=31, 30； put k2: 0+4+11=15, 16+4+11=31, 30,...,30
 		cmp := 1
 		if next != 0 {
 			o := p.nodeData[next]
 			cmp = p.cmp.Compare(p.kvData[o:o+p.nodeData[next+nKey]], key)
 		}
+		// node中的key小于查询的key，接着向后找
 		if cmp < 0 {
 			// Keep searching in this list
-			node = next
+			// 这里记录此key所在node在每层高度的前置node索引
+			node = next // put k3: 16, 32
 		} else {
 			if prev {
+				// 在put和get时，需要找到此key对应node的pre node，进行插入和删除
 				p.prevNode[h] = node
 			} else if cmp == 0 {
+				// node中的key等于查询的key
 				return next, true
 			}
+			// node中的key大于查询的key，下沉到下一层高度继续查找
+			// 找到最下面一层原始数据
 			if h == 0 {
 				return next, cmp == 0
 			}
+			// 下沉到下一层高度
 			h--
 		}
 	}
@@ -274,10 +376,14 @@ func (p *DB) findLast() int {
 // for that key; a DB is not a multi-map.
 //
 // It is safe to modify the contents of the arguments after Put returns.
+// todo 性能优化 kvData nodeData append优化成创建固定容量的slice？
+// key是InternalKey
 func (p *DB) Put(key []byte, value []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// nodeData中已经存在了这个key，则在kvData中追加数据，在nodeData中更新索引和value长度
+	// 此时不需要更新其他层级的索引
 	if node, exact := p.findGE(key, true); exact {
 		kvOffset := len(p.kvData)
 		p.kvData = append(p.kvData, key...)
@@ -289,6 +395,7 @@ func (p *DB) Put(key []byte, value []byte) error {
 		return nil
 	}
 
+	// 按照特定概率，"随机"选在要插入的高度
 	h := p.randHeight()
 	if h > p.maxHeight {
 		for i := p.maxHeight; i < h; i++ {
@@ -296,19 +403,22 @@ func (p *DB) Put(key []byte, value []byte) error {
 		}
 		p.maxHeight = h
 	}
-
+	// 追加数据到kvData
 	kvOffset := len(p.kvData)
 	p.kvData = append(p.kvData, key...)
 	p.kvData = append(p.kvData, value...)
-	// Node
-	node := len(p.nodeData)
+	// 追加node到nodeData中
+	// 最新的node
+	node := len(p.nodeData) // put k1:16; put k3:32; put k2:45
 	p.nodeData = append(p.nodeData, kvOffset, len(key), len(value), h)
 	for i, n := range p.prevNode[:h] {
-		m := n + nNext + i
+		m := n + nNext + i // 0 4 0,   11; 16+4+0, 8；32+4+0
+		// 给新node添加0-h层高度，对应的下一个节点的【索引】；就是前一个node中原来指向的那些节点
 		p.nodeData = append(p.nodeData, p.nodeData[m])
+		// 更新前一个node的0-h层高度，对应的下一个节点的索引；就是这个新node
 		p.nodeData[m] = node
 	}
-
+	// 更新kvSize，元素个数++
 	p.kvSize += len(key) + len(value)
 	p.n++
 	return nil
@@ -446,7 +556,7 @@ func (p *DB) Reset() {
 	p.n = 0
 	p.kvSize = 0
 	p.kvData = p.kvData[:0]
-	p.nodeData = p.nodeData[:nNext+tMaxHeight]
+	p.nodeData = p.nodeData[:nNext+tMaxHeight] // 最前面的是高层的
 	p.nodeData[nKV] = 0
 	p.nodeData[nKey] = 0
 	p.nodeData[nVal] = 0
@@ -466,6 +576,7 @@ func (p *DB) Reset() {
 // reclaim KV buffer.
 //
 // The returned DB instance is safe for concurrent use.
+// capacity 默认4M
 func New(cmp comparer.BasicComparer, capacity int) *DB {
 	p := &DB{
 		cmp:       cmp,
